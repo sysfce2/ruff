@@ -1,19 +1,20 @@
 #![allow(dead_code)]
 
+use red_knot_module_resolver::ModuleName;
 use ruff_python_ast as ast;
 use ruff_python_ast::AstNode;
 use std::fmt::Debug;
 
 use crate::db::{QueryResult, SemanticDb, SemanticJar};
 
-use crate::module::{resolve_module, ModuleName};
+use crate::module::resolve_module;
 use crate::parse::parse;
 use crate::semantic::types::{ModuleTypeId, Type};
 use crate::semantic::{
     resolve_global_symbol, semantic_index, ConstrainedDefinition, Definition, GlobalSymbolId,
     ImportDefinition, ImportFromDefinition,
 };
-use crate::{FileId, Name};
+use crate::FileId;
 
 // FIXME: Figure out proper dead-lock free synchronisation now that this takes `&db` instead of `&mut db`.
 /// Resolve the public-facing type for a symbol (the type seen by other scopes: other modules, or
@@ -136,7 +137,7 @@ pub fn infer_definition_type(
         Definition::Import(ImportDefinition {
             module: module_name,
         }) => {
-            if let Some(module) = resolve_module(db, module_name.clone())? {
+            if let Some(module) = resolve_module(db, &module_name)? {
                 Ok(Type::Module(ModuleTypeId { module, file_id }))
             } else {
                 Ok(Type::Unknown)
@@ -149,8 +150,9 @@ pub fn infer_definition_type(
         }) => {
             // TODO relative imports
             assert!(matches!(level, 0));
-            let module_name = ModuleName::new(module.as_ref().expect("TODO relative imports"));
-            let Some(module) = resolve_module(db, module_name.clone())? else {
+            let module_name =
+                ModuleName::new(module.as_ref().expect("TODO relative imports")).unwrap();
+            let Some(module) = resolve_module(db, &module_name)? else {
                 return Ok(Type::Unknown);
             };
 
@@ -315,7 +317,7 @@ fn infer_expr_type(db: &dyn SemanticDb, file_id: FileId, expr: &ast::Expr) -> Qu
         }
         ast::Expr::Attribute(ast::ExprAttribute { value, attr, .. }) => {
             let value_type = infer_expr_type(db, file_id, value)?;
-            let attr_name = &Name::new(&attr.id);
+            let attr_name = &attr.id;
             value_type
                 .get_member(db, attr_name)
                 .map(|ty| ty.unwrap_or(Type::Unknown))
@@ -343,15 +345,14 @@ fn infer_expr_type(db: &dyn SemanticDb, file_id: FileId, expr: &ast::Expr) -> Qu
 #[cfg(test)]
 mod tests {
 
+    use red_knot_module_resolver::ModuleName;
+    use ruff_python_ast::name::Name;
     use std::path::PathBuf;
 
     use crate::db::tests::TestDb;
     use crate::db::{HasJar, SemanticJar};
-    use crate::module::{
-        resolve_module, set_module_search_paths, ModuleName, ModuleResolutionInputs,
-    };
+    use crate::module::{resolve_module, set_module_search_paths, ModuleResolutionInputs};
     use crate::semantic::{infer_symbol_public_type, resolve_global_symbol, Type};
-    use crate::Name;
 
     // TODO with virtual filesystem we shouldn't have to write files to disk for these
     // tests
@@ -395,7 +396,8 @@ mod tests {
         variable_name: &str,
     ) -> anyhow::Result<Type> {
         let db = &case.db;
-        let module = resolve_module(db, ModuleName::new(module_name))?.expect("Module to exist");
+        let module =
+            resolve_module(db, &ModuleName::new(module_name).unwrap())?.expect("Module to exist");
         let symbol = resolve_global_symbol(db, module, variable_name)?.expect("symbol to exist");
 
         Ok(infer_symbol_public_type(db, symbol)?)
@@ -476,7 +478,7 @@ mod tests {
         };
 
         let member_ty = class_id
-            .get_own_class_member(&case.db, &Name::new("f"))
+            .get_own_class_member(&case.db, &Name::new_static("f"))
             .expect("C.f to resolve");
 
         let Some(Type::Function(func_id)) = member_ty else {

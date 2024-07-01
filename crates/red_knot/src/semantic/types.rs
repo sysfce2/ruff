@@ -2,11 +2,11 @@
 use crate::ast_ids::NodeKey;
 use crate::db::{QueryResult, SemanticDb, SemanticJar};
 use crate::files::FileId;
-use crate::module::{Module, ModuleName};
+use crate::module::Module;
 use crate::semantic::{
     resolve_global_symbol, semantic_index, GlobalSymbolId, ScopeId, ScopeKind, SymbolId,
 };
-use crate::{FxDashMap, FxIndexSet, Name};
+use crate::{FxDashMap, FxIndexSet};
 use ruff_index::{newtype_index, IndexVec};
 use ruff_python_ast as ast;
 use rustc_hash::FxHashMap;
@@ -14,6 +14,8 @@ use rustc_hash::FxHashMap;
 pub(crate) mod infer;
 
 pub(crate) use infer::{infer_definition_type, infer_symbol_public_type};
+use red_knot_module_resolver::ModuleName;
+use ruff_python_ast::name::Name;
 
 /// unique ID for a type
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -346,19 +348,9 @@ impl TypeStore {
     }
 }
 
-type ModuleStoreRef<'a> = dashmap::mapref::one::Ref<
-    'a,
-    FileId,
-    ModuleTypeStore,
-    std::hash::BuildHasherDefault<rustc_hash::FxHasher>,
->;
+type ModuleStoreRef<'a> = dashmap::mapref::one::Ref<'a, FileId, ModuleTypeStore>;
 
-type ModuleStoreRefMut<'a> = dashmap::mapref::one::RefMut<
-    'a,
-    FileId,
-    ModuleTypeStore,
-    std::hash::BuildHasherDefault<rustc_hash::FxHasher>,
->;
+type ModuleStoreRefMut<'a> = dashmap::mapref::one::RefMut<'a, FileId, ModuleTypeStore>;
 
 #[derive(Debug)]
 pub(crate) struct FunctionTypeRef<'a> {

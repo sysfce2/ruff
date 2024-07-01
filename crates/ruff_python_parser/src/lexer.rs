@@ -12,6 +12,7 @@ use std::str::FromStr;
 use unicode_ident::{is_xid_continue, is_xid_start};
 use unicode_normalization::UnicodeNormalization;
 
+use ruff_python_ast::name::Name;
 use ruff_python_ast::{Int, IpyEscapeKind, StringFlags};
 use ruff_python_trivia::is_python_whitespace;
 use ruff_text_size::{TextLen, TextRange, TextSize};
@@ -247,7 +248,7 @@ impl<'src> Lexer<'src> {
                     } else if !self.cursor.eat_char('\n') {
                         return Some(self.push_error(LexicalError::new(
                             LexicalErrorType::LineContinuationError,
-                            TextRange::at(self.offset(), self.cursor.first().text_len()),
+                            TextRange::at(self.offset() - '\\'.text_len(), '\\'.text_len()),
                         )));
                     }
                     indentation = Indentation::root();
@@ -339,7 +340,7 @@ impl<'src> Lexer<'src> {
                     } else if !self.cursor.eat_char('\n') {
                         return Err(LexicalError::new(
                             LexicalErrorType::LineContinuationError,
-                            TextRange::at(self.offset(), self.cursor.first().text_len()),
+                            TextRange::at(self.offset() - '\\'.text_len(), '\\'.text_len()),
                         ));
                     }
                 }
@@ -643,7 +644,7 @@ impl<'src> Lexer<'src> {
         let text = self.token_text();
 
         if !is_ascii {
-            self.current_value = TokenValue::Name(text.nfkc().collect::<String>().into_boxed_str());
+            self.current_value = TokenValue::Name(text.nfkc().collect::<Name>());
             return TokenKind::Name;
         }
 
@@ -687,7 +688,7 @@ impl<'src> Lexer<'src> {
             "with" => TokenKind::With,
             "yield" => TokenKind::Yield,
             _ => {
-                self.current_value = TokenValue::Name(text.to_string().into_boxed_str());
+                self.current_value = TokenValue::Name(Name::new(text));
                 TokenKind::Name
             }
         }
@@ -962,25 +963,30 @@ impl<'src> Lexer<'src> {
 
                 // Skip up to the current character.
                 self.cursor.skip_bytes(index);
-                let ch = self.cursor.bump();
+
+                // Lookahead because we want to bump only if it's a quote or being escaped.
+                let quote_or_newline = self.cursor.first();
 
                 // If the character is escaped, continue scanning.
                 if num_backslashes % 2 == 1 {
-                    if ch == Some('\r') {
+                    self.cursor.bump();
+                    if quote_or_newline == '\r' {
                         self.cursor.eat_char('\n');
                     }
                     continue;
                 }
 
-                match ch {
-                    Some(newline @ ('\r' | '\n')) => {
+                match quote_or_newline {
+                    '\r' | '\n' => {
                         return self.push_error(LexicalError::new(
                             LexicalErrorType::UnclosedStringError,
-                            self.token_range().sub_end(newline.text_len()),
+                            self.token_range(),
                         ));
                     }
-                    Some(ch) if ch == quote => {
-                        break self.offset() - TextSize::new(1);
+                    ch if ch == quote => {
+                        let value_end = self.offset();
+                        self.cursor.bump();
+                        break value_end;
                     }
                     _ => unreachable!("memchr2 returned an index that is not a quote or a newline"),
                 }
@@ -1314,7 +1320,8 @@ impl<'src> Lexer<'src> {
         }
     }
 
-    /// Re-lex the current token in the context of a logical line.
+    /// Re-lex the [`NonLogicalNewline`] token at the given position in the context of a logical
+    /// line.
     ///
     /// Returns a boolean indicating whether the lexer's position has changed. This could result
     /// into the new current token being different than the previous current token but is not
@@ -1368,7 +1375,10 @@ impl<'src> Lexer<'src> {
     ///
     /// [`Newline`]: TokenKind::Newline
     /// [`NonLogicalNewline`]: TokenKind::NonLogicalNewline
-    pub(crate) fn re_lex_logical_token(&mut self) -> bool {
+    pub(crate) fn re_lex_logical_token(
+        &mut self,
+        non_logical_newline_start: Option<TextSize>,
+    ) -> bool {
         if self.nesting == 0 {
             return false;
         }
@@ -1383,84 +1393,35 @@ impl<'src> Lexer<'src> {
             return false;
         }
 
-        let mut current_position = self.current_range().start();
-        let mut reverse_chars = self.source[..current_position.to_usize()]
-            .chars()
-            .rev()
-            .peekable();
-        let mut newline_position = None;
+        let Some(new_position) = non_logical_newline_start else {
+            return false;
+        };
 
-        while let Some(ch) = reverse_chars.next() {
-            if is_python_whitespace(ch) {
-                current_position -= ch.text_len();
-                continue;
-            }
-
-            match ch {
-                '\n' => {
-                    current_position -= ch.text_len();
-                    if let Some(carriage_return) = reverse_chars.next_if_eq(&'\r') {
-                        current_position -= carriage_return.text_len();
-                    }
-                }
-                '\r' => {
-                    current_position -= ch.text_len();
-                }
-                _ => break,
-            }
-
-            debug_assert!(matches!(ch, '\n' | '\r'));
-
-            // Count the number of backslashes before the newline character.
-            let mut backslash_count = 0;
-            while reverse_chars.next_if_eq(&'\\').is_some() {
-                backslash_count += 1;
-            }
-
-            if backslash_count == 0 {
-                // No escapes: `\n`
-                newline_position = Some(current_position);
-            } else {
-                if backslash_count % 2 == 0 {
-                    // Even number of backslashes i.e., all backslashes cancel each other out
-                    // which means the newline character is not being escaped.
-                    newline_position = Some(current_position);
-                }
-                current_position -= TextSize::new('\\'.text_len().to_u32() * backslash_count);
-            }
+        // Earlier we reduced the nesting level unconditionally. Now that we know the lexer's
+        // position is going to be moved back, the lexer needs to be put back into a
+        // parenthesized context if the current token is a closing parenthesis.
+        //
+        // ```py
+        // (a, [b,
+        //     c
+        // )
+        // ```
+        //
+        // Here, the parser would request to re-lex the token when it's at `)` and can recover
+        // from an unclosed `[`. This method will move the lexer back to the newline character
+        // after `c` which means it goes back into parenthesized context.
+        if matches!(
+            self.current_kind,
+            TokenKind::Rpar | TokenKind::Rsqb | TokenKind::Rbrace
+        ) {
+            self.nesting += 1;
         }
 
-        // The lexer should only be moved if there's a newline character which needs to be
-        // re-lexed.
-        if let Some(newline_position) = newline_position {
-            // Earlier we reduced the nesting level unconditionally. Now that we know the lexer's
-            // position is going to be moved back, the lexer needs to be put back into a
-            // parenthesized context if the current token is a closing parenthesis.
-            //
-            // ```py
-            // (a, [b,
-            //     c
-            // )
-            // ```
-            //
-            // Here, the parser would request to re-lex the token when it's at `)` and can recover
-            // from an unclosed `[`. This method will move the lexer back to the newline character
-            // after `c` which means it goes back into parenthesized context.
-            if matches!(
-                self.current_kind,
-                TokenKind::Rpar | TokenKind::Rsqb | TokenKind::Rbrace
-            ) {
-                self.nesting += 1;
-            }
-
-            self.cursor = Cursor::new(self.source);
-            self.cursor.skip_bytes(newline_position.to_usize());
-            self.state = State::Other;
-            self.next_token();
-            true
-        } else {
-            false
-        }
+        self.cursor = Cursor::new(self.source);
+        self.cursor.skip_bytes(new_position.to_usize());
+        self.state = State::Other;
+        self.next_token();
+        true
     }
 
     #[inline]

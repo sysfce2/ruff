@@ -9,13 +9,12 @@ use crate::cache::KeyValueCache;
 use crate::db::{QueryResult, SemanticDb, SemanticJar};
 use crate::files::FileId;
 use crate::module::Module;
-use crate::module::ModuleName;
 use crate::parse::parse;
-use crate::Name;
 pub(crate) use definitions::Definition;
 use definitions::{ImportDefinition, ImportFromDefinition};
 pub(crate) use flow_graph::ConstrainedDefinition;
 use flow_graph::{FlowGraph, FlowGraphBuilder, FlowNodeId, ReachableDefinitionsIterator};
+use red_knot_module_resolver::ModuleName;
 use ruff_index::{newtype_index, IndexVec};
 use rustc_hash::FxHashMap;
 use std::ops::{Deref, DerefMut};
@@ -411,7 +410,7 @@ impl SourceOrderVisitor<'_> for SemanticIndexer {
                         alias.name.id.split('.').next().unwrap()
                     };
 
-                    let module = ModuleName::new(&alias.name.id);
+                    let module = ModuleName::new(&alias.name.id).unwrap();
 
                     let def = Definition::Import(ImportDefinition {
                         module: module.clone(),
@@ -427,7 +426,7 @@ impl SourceOrderVisitor<'_> for SemanticIndexer {
                 level,
                 ..
             }) => {
-                let module = module.as_ref().map(|m| ModuleName::new(&m.id));
+                let module = module.as_ref().and_then(|m| ModuleName::new(&m.id));
 
                 for alias in names {
                     let symbol_name = if let Some(asname) = &alias.asname {
@@ -437,7 +436,7 @@ impl SourceOrderVisitor<'_> for SemanticIndexer {
                     };
                     let def = Definition::ImportFrom(ImportFromDefinition {
                         module: module.clone(),
-                        name: Name::new(&alias.name.id),
+                        name: alias.name.id.clone(),
                         level: *level,
                     });
                     self.add_or_update_symbol_with_def(symbol_name, def);
