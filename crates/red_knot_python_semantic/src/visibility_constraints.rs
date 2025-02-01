@@ -168,11 +168,26 @@ use crate::Db;
 /// resulting from a few files with a lot of boolean expressions and `if`-statements.
 const MAX_RECURSION_DEPTH: usize = 24;
 
+/// A ternary formula that defines under what conditions a binding is visible. (A ternary formula
+/// is just like a boolean formula, but with `Ambiguous` as a third potential result. See the
+/// module documentation for more details.)
+///
+/// The primitive atoms of the formula are [`Constraint`]s, which express some property of the
+/// runtime state of the code that we are analyzing.
+///
+/// We assume that each atom has a stable value each time that the formula is evaluated. An atom
+/// that resolves to `Ambiguous` might be true or false, and we can't tell which — but within that
+/// evaluation, we assume that the atom has the _same_ unknown value each time it appears. That
+/// allows us to perform simplifications like `A ∨ !A → true` and `A ∧ !A → false`.
+///
+/// That means that when you are constructing a formula, you might need to create distinct atoms
+/// for a particular [`Constraint`], if your formula needs to consider how a particular runtime
+/// property might be different at different points in the execution of the program.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum VisibilityConstraint<'db> {
     AlwaysTrue,
     Ambiguous,
-    VisibleIf(Constraint<'db>),
+    VisibleIf(Constraint<'db>, u8),
     VisibleIfNot(ScopedVisibilityConstraintId),
     KleeneAnd(ScopedVisibilityConstraintId, ScopedVisibilityConstraintId),
     KleeneOr(ScopedVisibilityConstraintId, ScopedVisibilityConstraintId),
@@ -221,11 +236,18 @@ impl<'db> VisibilityConstraints<'db> {
         b: ScopedVisibilityConstraintId,
     ) -> ScopedVisibilityConstraintId {
         if a == ScopedVisibilityConstraintId::ALWAYS_TRUE {
-            b
+            return b;
         } else if b == ScopedVisibilityConstraintId::ALWAYS_TRUE {
-            a
-        } else {
-            self.add(VisibilityConstraint::KleeneAnd(a, b))
+            return a;
+        }
+        match (&self.constraints[a], &self.constraints[b]) {
+            (_, VisibilityConstraint::VisibleIfNot(id)) if a == *id => self.add(
+                VisibilityConstraint::VisibleIfNot(ScopedVisibilityConstraintId::ALWAYS_TRUE),
+            ),
+            (VisibilityConstraint::VisibleIfNot(id), _) if *id == b => self.add(
+                VisibilityConstraint::VisibleIfNot(ScopedVisibilityConstraintId::ALWAYS_TRUE),
+            ),
+            _ => self.add(VisibilityConstraint::KleeneAnd(a, b)),
         }
     }
 
@@ -248,7 +270,7 @@ impl<'db> VisibilityConstraints<'db> {
         match visibility_constraint {
             VisibilityConstraint::AlwaysTrue => Truthiness::AlwaysTrue,
             VisibilityConstraint::Ambiguous => Truthiness::Ambiguous,
-            VisibilityConstraint::VisibleIf(constraint) => Self::analyze_single(db, constraint),
+            VisibilityConstraint::VisibleIf(constraint, _) => Self::analyze_single(db, constraint),
             VisibilityConstraint::VisibleIfNot(negated) => {
                 self.evaluate_impl(db, *negated, max_depth - 1).negate()
             }
@@ -294,8 +316,8 @@ impl<'db> VisibilityConstraints<'db> {
             ConstraintNode::Expression(test_expr) => {
                 let inference = infer_expression_types(db, test_expr);
                 let scope = test_expr.scope(db);
-                let ty =
-                    inference.expression_ty(test_expr.node_ref(db).scoped_expression_id(db, scope));
+                let ty = inference
+                    .expression_type(test_expr.node_ref(db).scoped_expression_id(db, scope));
 
                 ty.bool(db).negate_if(!constraint.is_positive)
             }
@@ -304,7 +326,7 @@ impl<'db> VisibilityConstraints<'db> {
                     let subject_expression = inner.subject(db);
                     let inference = infer_expression_types(db, *subject_expression);
                     let scope = subject_expression.scope(db);
-                    let subject_ty = inference.expression_ty(
+                    let subject_ty = inference.expression_type(
                         subject_expression
                             .node_ref(db)
                             .scoped_expression_id(db, scope),
@@ -312,8 +334,8 @@ impl<'db> VisibilityConstraints<'db> {
 
                     let inference = infer_expression_types(db, *value);
                     let scope = value.scope(db);
-                    let value_ty =
-                        inference.expression_ty(value.node_ref(db).scoped_expression_id(db, scope));
+                    let value_ty = inference
+                        .expression_type(value.node_ref(db).scoped_expression_id(db, scope));
 
                     if subject_ty.is_single_valued(db) {
                         let truthiness =

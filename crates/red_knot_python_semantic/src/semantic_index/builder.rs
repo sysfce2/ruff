@@ -365,7 +365,13 @@ impl<'db> SemanticIndexBuilder<'db> {
         constraint: Constraint<'db>,
     ) -> ScopedVisibilityConstraintId {
         self.current_use_def_map_mut()
-            .record_visibility_constraint(VisibilityConstraint::VisibleIf(constraint))
+            .record_visibility_constraint(VisibilityConstraint::VisibleIf(constraint, 0))
+    }
+
+    /// Records that all remaining statements in the current block are unreachable, and therefore
+    /// not visible.
+    fn mark_unreachable(&mut self) {
+        self.current_use_def_map_mut().mark_unreachable();
     }
 
     /// Records a [`VisibilityConstraint::Ambiguous`] constraint.
@@ -603,8 +609,8 @@ impl<'db> SemanticIndexBuilder<'db> {
 
         let definition = self.add_definition(symbol, parameter);
 
-        // Insert a mapping from the inner Parameter node to the same definition.
-        // This ensures that calling `HasTy::ty` on the inner parameter returns
+        // Insert a mapping from the inner Parameter node to the same definition. This
+        // ensures that calling `HasType::inferred_type` on the inner parameter returns
         // a valid type (and doesn't panic)
         let existing_definition = self
             .definitions_by_node
@@ -964,6 +970,14 @@ where
                 let pre_loop = self.flow_snapshot();
                 let constraint = self.record_expression_constraint(test);
 
+                // We need multiple copies of the visibility constraint for the while condition,
+                // since we need to model situations where the first evaluation of the condition
+                // returns True, but a later evaluation returns False.
+                let first_vis_constraint_id =
+                    self.add_visibility_constraint(VisibilityConstraint::VisibleIf(constraint, 0));
+                let later_vis_constraint_id =
+                    self.add_visibility_constraint(VisibilityConstraint::VisibleIf(constraint, 1));
+
                 // Save aside any break states from an outer loop
                 let saved_break_states = std::mem::take(&mut self.loop_break_states);
 
@@ -974,26 +988,42 @@ where
                 self.visit_body(body);
                 self.set_inside_loop(outer_loop_state);
 
-                let vis_constraint_id = self.record_visibility_constraint(constraint);
+                // If the body is executed, we know that we've evaluated the condition at least
+                // once, and that the first evaluation was True. We might not have evaluated the
+                // condition more than once, so we can't assume that later evaluations were True.
+                // So the body's full visibility constraint is `first`.
+                let body_vis_constraint_id = first_vis_constraint_id;
+                self.record_visibility_constraint_id(body_vis_constraint_id);
 
                 // Get the break states from the body of this loop, and restore the saved outer
                 // ones.
                 let break_states =
                     std::mem::replace(&mut self.loop_break_states, saved_break_states);
 
-                // We may execute the `else` clause without ever executing the body, so merge in
-                // the pre-loop state before visiting `else`.
-                self.flow_merge(pre_loop.clone());
+                // We execute the `else` once the condition evaluates to false. This could happen
+                // without ever executing the body, if the condition is false the first time it's
+                // tested. So the starting flow state of the `else` clause is the union of:
+                //   - the pre-loop state with a visibility constraint that the first evaluation of
+                //     the while condition was false,
+                //   - the post-body state (which already has a visibility constraint that the
+                //     first evaluation was true) with a visibility constraint that a _later_
+                //     evaluation of the while condition was false.
+                // To model this correctly, we need two copies of the while condition constraint,
+                // since the first and later evaluations might produce different results.
+                let post_body = self.flow_snapshot();
+                self.flow_restore(pre_loop.clone());
+                self.record_negated_visibility_constraint(first_vis_constraint_id);
+                self.flow_merge(post_body);
                 self.record_negated_constraint(constraint);
                 self.visit_body(orelse);
-                self.record_negated_visibility_constraint(vis_constraint_id);
+                self.record_negated_visibility_constraint(later_vis_constraint_id);
 
                 // Breaking out of a while loop bypasses the `else` clause, so merge in the break
                 // states after visiting `else`.
                 for break_state in break_states {
                     let snapshot = self.flow_snapshot();
                     self.flow_restore(break_state);
-                    self.record_visibility_constraint(constraint);
+                    self.record_visibility_constraint_id(body_vis_constraint_id);
                     self.flow_merge(snapshot);
                 }
 
@@ -1018,11 +1048,6 @@ where
                     }
                 }
                 self.visit_body(body);
-            }
-            ast::Stmt::Break(_) => {
-                if self.loop_state().is_inside() {
-                    self.loop_break_states.push(self.flow_snapshot());
-                }
             }
 
             ast::Stmt::For(
@@ -1270,6 +1295,21 @@ where
                 // - https://github.com/astral-sh/ruff/pull/13633#discussion_r1788626702
                 self.visit_body(finalbody);
             }
+
+            ast::Stmt::Raise(_) | ast::Stmt::Return(_) | ast::Stmt::Continue(_) => {
+                walk_stmt(self, stmt);
+                // Everything in the current block after a terminal statement is unreachable.
+                self.mark_unreachable();
+            }
+
+            ast::Stmt::Break(_) => {
+                if self.loop_state().is_inside() {
+                    self.loop_break_states.push(self.flow_snapshot());
+                }
+                // Everything in the current block after a terminal statement is unreachable.
+                self.mark_unreachable();
+            }
+
             _ => {
                 walk_stmt(self, stmt);
             }
@@ -1507,8 +1547,9 @@ where
                             ast::BoolOp::And => (constraint, self.add_constraint(constraint)),
                             ast::BoolOp::Or => self.add_negated_constraint(constraint),
                         };
-                        let visibility_constraint = self
-                            .add_visibility_constraint(VisibilityConstraint::VisibleIf(constraint));
+                        let visibility_constraint = self.add_visibility_constraint(
+                            VisibilityConstraint::VisibleIf(constraint, 0),
+                        );
 
                         let after_expr = self.flow_snapshot();
 

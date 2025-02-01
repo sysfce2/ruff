@@ -1,14 +1,16 @@
 use crate::checkers::ast::Checker;
-use crate::importer::ImportRequest;
+use crate::importer::{ImportRequest, ResolutionError};
+use crate::settings::types::PythonVersion;
 use itertools::Itertools;
 use ruff_diagnostics::{Applicability, Diagnostic, Edit, Fix, FixAvailability, Violation};
 use ruff_macros::{derive_message_formats, ViolationMetadata};
-use ruff_python_ast as ast;
-use ruff_python_ast::helpers::map_subscript;
-use ruff_python_ast::{Expr, Parameters, TypeParam, TypeParams};
+use ruff_python_ast::{
+    self as ast, Expr, ExprName, ExprSubscript, Parameters, TypeParam, TypeParams,
+};
 use ruff_python_semantic::analyze::function_type::{self, FunctionType};
 use ruff_python_semantic::analyze::visibility::{is_abstract, is_overload};
-use ruff_text_size::{Ranged, TextRange};
+use ruff_python_semantic::SemanticModel;
+use ruff_text_size::{Ranged, TextRange, TextSize};
 
 /// ## What it does
 /// Checks for methods that define a custom `TypeVar` for their return type
@@ -59,7 +61,6 @@ use ruff_text_size::{Ranged, TextRange};
 #[derive(ViolationMetadata)]
 pub(crate) struct CustomTypeVarReturnType {
     method_name: String,
-    in_stub: bool,
 }
 
 impl Violation for CustomTypeVarReturnType {
@@ -72,12 +73,7 @@ impl Violation for CustomTypeVarReturnType {
     }
 
     fn fix_title(&self) -> Option<String> {
-        // See `replace_custom_typevar_with_self`'s doc comment
-        if self.in_stub {
-            Some("Replace with `Self`".to_string())
-        } else {
-            None
-        }
+        Some("Replace with `Self`".to_string())
     }
 }
 
@@ -135,7 +131,7 @@ pub(crate) fn custom_type_var_return_type(
         }),
     };
 
-    if method.uses_custom_var() {
+    if method.uses_custom_var(semantic) {
         add_diagnostic(checker, function_def, returns);
     }
 }
@@ -147,9 +143,9 @@ enum Method<'a> {
 }
 
 impl Method<'_> {
-    fn uses_custom_var(&self) -> bool {
+    fn uses_custom_var(&self, semantic: &SemanticModel) -> bool {
         match self {
-            Self::Class(class_method) => class_method.uses_custom_var(),
+            Self::Class(class_method) => class_method.uses_custom_var(semantic),
             Self::Instance(instance_method) => instance_method.uses_custom_var(),
         }
     }
@@ -165,34 +161,45 @@ struct ClassMethod<'a> {
 impl ClassMethod<'_> {
     /// Returns `true` if the class method is annotated with
     /// a custom `TypeVar` that is likely private.
-    fn uses_custom_var(&self) -> bool {
-        let Expr::Subscript(ast::ExprSubscript { slice, value, .. }) = self.cls_annotation else {
+    fn uses_custom_var(&self, semantic: &SemanticModel) -> bool {
+        let Expr::Subscript(ast::ExprSubscript {
+            value: cls_annotation_value,
+            slice: cls_annotation_typevar,
+            ..
+        }) = self.cls_annotation
+        else {
             return false;
         };
 
-        let Expr::Name(value) = value.as_ref() else {
+        let Expr::Name(cls_annotation_typevar) = &**cls_annotation_typevar else {
             return false;
         };
 
-        // Don't error if the first argument is annotated with typing.Type[T].
-        // These are edge cases, and it's hard to give good error messages for them.
-        if value.id != "type" {
-            return false;
-        };
+        let cls_annotation_typevar = &cls_annotation_typevar.id;
 
-        let Expr::Name(slice) = slice.as_ref() else {
-            return false;
-        };
-
-        let Expr::Name(return_annotation) = map_subscript(self.returns) else {
-            return false;
-        };
-
-        if slice.id != return_annotation.id {
+        if !semantic.match_builtin_expr(cls_annotation_value, "type") {
             return false;
         }
 
-        is_likely_private_typevar(&slice.id, self.type_params)
+        let return_annotation_typevar = match self.returns {
+            Expr::Name(ExprName { id, .. }) => id,
+            Expr::Subscript(ExprSubscript { value, slice, .. }) => {
+                let Expr::Name(return_annotation_typevar) = &**slice else {
+                    return false;
+                };
+                if !semantic.match_builtin_expr(value, "type") {
+                    return false;
+                }
+                &return_annotation_typevar.id
+            }
+            _ => return false,
+        };
+
+        if cls_annotation_typevar != return_annotation_typevar {
+            return false;
+        }
+
+        is_likely_private_typevar(cls_annotation_typevar, self.type_params)
     }
 }
 
@@ -216,7 +223,7 @@ impl InstanceMethod<'_> {
 
         let Expr::Name(ast::ExprName {
             id: return_type, ..
-        }) = map_subscript(self.returns)
+        }) = self.returns
         else {
             return false;
         };
@@ -248,22 +255,15 @@ fn is_likely_private_typevar(type_var_name: &str, type_params: Option<&TypeParam
 }
 
 fn add_diagnostic(checker: &mut Checker, function_def: &ast::StmtFunctionDef, returns: &Expr) {
-    let in_stub = checker.source_type.is_stub();
-
     let mut diagnostic = Diagnostic::new(
         CustomTypeVarReturnType {
             method_name: function_def.name.to_string(),
-            in_stub,
         },
         returns.range(),
     );
 
-    // See `replace_custom_typevar_with_self`'s doc comment
-    if in_stub {
-        if let Some(fix) = replace_custom_typevar_with_self(checker, function_def, returns) {
-            diagnostic.set_fix(fix);
-        }
-    }
+    diagnostic
+        .try_set_optional_fix(|| replace_custom_typevar_with_self(checker, function_def, returns));
 
     checker.diagnostics.push(diagnostic);
 }
@@ -276,10 +276,6 @@ fn add_diagnostic(checker: &mut Checker, function_def: &ast::StmtFunctionDef, re
 /// * Replace other uses of the original type variable elsewhere in the signature with `Self`
 /// * Remove that type variable from the PEP 695 type parameter list
 ///
-/// This fix cannot be suggested for non-stubs,
-/// as a non-stub fix would have to deal with references in body/at runtime as well,
-/// which is substantially harder and requires a type-aware backend.
-///
 /// The fourth step above has the same problem.
 /// This function thus only does replacements for the simplest of cases
 /// and will mark the fix as unsafe if an annotation cannot be handled.
@@ -287,56 +283,58 @@ fn replace_custom_typevar_with_self(
     checker: &Checker,
     function_def: &ast::StmtFunctionDef,
     returns: &Expr,
-) -> Option<Fix> {
+) -> anyhow::Result<Option<Fix>> {
     if checker.settings.preview.is_disabled() {
-        return None;
+        return Ok(None);
     }
 
-    // The return annotation is guaranteed to be a name,
-    // as verified by `uses_custom_var()`.
-    let typevar_name = returns.as_name_expr().unwrap().id();
+    // This fix cannot be suggested for non-stubs,
+    // as a non-stub fix would have to deal with references in body/at runtime as well,
+    // which is substantially harder and requires a type-aware backend.
+    if !checker.source_type.is_stub() {
+        return Ok(None);
+    }
+
+    // Non-`Name` return annotations are not currently autofixed
+    let Expr::Name(typevar_name) = &returns else {
+        return Ok(None);
+    };
+
+    let typevar_name = &typevar_name.id;
+
+    let (import_edit, self_symbol_binding) = import_self(checker, returns.start())?;
 
     let mut all_edits = vec![
-        replace_return_annotation_with_self(returns),
+        import_edit,
+        replace_return_annotation_with_self(self_symbol_binding, returns),
         remove_first_parameter_annotation(&function_def.parameters),
     ];
 
-    let edit = import_self(checker, returns.range())?;
-    all_edits.push(edit);
+    all_edits.extend(remove_typevar_declaration(
+        function_def.type_params.as_deref(),
+        typevar_name,
+    ));
 
-    if let Some(edit) =
-        remove_typevar_declaration(function_def.type_params.as_deref(), typevar_name)
-    {
-        all_edits.push(edit);
-    }
-
-    let (mut edits, fix_applicability) =
+    let (edits, fix_applicability) =
         replace_typevar_usages_with_self(&function_def.parameters, typevar_name);
-    all_edits.append(&mut edits);
+
+    all_edits.extend(edits);
 
     let (first, rest) = (all_edits.swap_remove(0), all_edits);
 
-    Some(Fix::applicable_edits(first, rest, fix_applicability))
+    Ok(Some(Fix::applicable_edits(first, rest, fix_applicability)))
 }
 
-fn import_self(checker: &Checker, return_range: TextRange) -> Option<Edit> {
-    // From PYI034's fix
-    let target_version = checker.settings.target_version.as_tuple();
-    let source_module = if target_version >= (3, 11) {
+fn import_self(checker: &Checker, position: TextSize) -> Result<(Edit, String), ResolutionError> {
+    // See also PYI034's fix
+    let source_module = if checker.settings.target_version >= PythonVersion::Py311 {
         "typing"
     } else {
         "typing_extensions"
     };
-
     let (importer, semantic) = (checker.importer(), checker.semantic());
     let request = ImportRequest::import_from(source_module, "Self");
-
-    let position = return_range.start();
-    let (edit, ..) = importer
-        .get_or_import_symbol(&request, position, semantic)
-        .ok()?;
-
-    Some(edit)
+    importer.get_or_import_symbol(&request, position, semantic)
 }
 
 fn remove_first_parameter_annotation(parameters: &Parameters) -> Edit {
@@ -351,8 +349,8 @@ fn remove_first_parameter_annotation(parameters: &Parameters) -> Edit {
     Edit::deletion(name_end, annotation_end)
 }
 
-fn replace_return_annotation_with_self(returns: &Expr) -> Edit {
-    Edit::range_replacement("Self".to_string(), returns.range())
+fn replace_return_annotation_with_self(self_symbol_binding: String, returns: &Expr) -> Edit {
+    Edit::range_replacement(self_symbol_binding, returns.range())
 }
 
 fn replace_typevar_usages_with_self(
@@ -419,7 +417,7 @@ fn remove_typevar_declaration(type_params: Option<&TypeParams>, name: &str) -> O
         // [A, B, C]
         //      ^^^ Remove this
         let previous_range = parameters[index - 1].range();
-        TextRange::new(previous_range.end(), typevar_range.start())
+        TextRange::new(previous_range.end(), typevar_range.end())
     };
 
     Some(Edit::range_deletion(range))
