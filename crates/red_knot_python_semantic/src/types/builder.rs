@@ -43,6 +43,13 @@ impl<'db> UnionBuilder<'db> {
         }
     }
 
+    /// Collapse the union to a single type: `object`.
+    fn collapse_to_object(mut self) -> Self {
+        self.elements.clear();
+        self.elements.push(Type::object(self.db));
+        self
+    }
+
     /// Adds a type to this union.
     pub(crate) fn add(mut self, ty: Type<'db>) -> Self {
         match ty {
@@ -53,7 +60,12 @@ impl<'db> UnionBuilder<'db> {
                     self = self.add(*element);
                 }
             }
+            // Adding `Never` to a union is a no-op.
             Type::Never => {}
+            // Adding `object` to a union results in `object`.
+            ty if ty.is_object(self.db) => {
+                return self.collapse_to_object();
+            }
             _ => {
                 let bool_pair = if let Type::BooleanLiteral(b) = ty {
                     Some(Type::BooleanLiteral(!b))
@@ -76,7 +88,10 @@ impl<'db> UnionBuilder<'db> {
                         break;
                     }
 
-                    if ty.is_same_gradual_form(*element) || ty.is_subtype_of(self.db, *element) {
+                    if ty.is_same_gradual_form(*element)
+                        || ty.is_subtype_of(self.db, *element)
+                        || element.is_object(self.db)
+                    {
                         return self;
                     } else if element.is_subtype_of(self.db, ty) {
                         to_remove.push(index);
@@ -88,9 +103,7 @@ impl<'db> UnionBuilder<'db> {
                         // `element | ty` must be `object` (object has no other supertypes). This means we can simplify
                         // the whole union to just `object`, since all other potential elements would also be subtypes of
                         // `object`.
-                        self.elements.clear();
-                        self.elements.push(KnownClass::Object.to_instance(self.db));
-                        return self;
+                        return self.collapse_to_object();
                     }
                 }
                 match to_remove[..] {
@@ -247,131 +260,150 @@ struct InnerIntersectionBuilder<'db> {
 impl<'db> InnerIntersectionBuilder<'db> {
     /// Adds a positive type to this intersection.
     fn add_positive(&mut self, db: &'db dyn Db, mut new_positive: Type<'db>) {
-        if new_positive == Type::AlwaysTruthy && self.positive.contains(&Type::LiteralString) {
-            self.add_negative(db, Type::string_literal(db, ""));
-            return;
-        }
-
-        if let Type::Intersection(other) = new_positive {
-            for pos in other.positive(db) {
-                self.add_positive(db, *pos);
+        match new_positive {
+            // `LiteralString & AlwaysTruthy` -> `LiteralString & ~Literal[""]`
+            Type::AlwaysTruthy if self.positive.contains(&Type::LiteralString) => {
+                self.add_negative(db, Type::string_literal(db, ""));
             }
-            for neg in other.negative(db) {
-                self.add_negative(db, *neg);
+            // `LiteralString & AlwaysFalsy` -> `Literal[""]`
+            Type::AlwaysFalsy if self.positive.swap_remove(&Type::LiteralString) => {
+                self.add_positive(db, Type::string_literal(db, ""));
             }
-        } else {
-            let addition_is_bool_instance = new_positive
-                .into_instance()
-                .and_then(|instance| instance.class.known(db))
-                .is_some_and(KnownClass::is_bool);
-
-            for (index, existing_positive) in self.positive.iter().enumerate() {
-                match existing_positive {
-                    // `AlwaysTruthy & bool` -> `Literal[True]`
-                    Type::AlwaysTruthy if addition_is_bool_instance => {
-                        new_positive = Type::BooleanLiteral(true);
-                    }
-                    // `AlwaysFalsy & bool` -> `Literal[False]`
-                    Type::AlwaysFalsy if addition_is_bool_instance => {
-                        new_positive = Type::BooleanLiteral(false);
-                    }
-                    // `AlwaysFalsy & LiteralString` -> `Literal[""]`
-                    Type::AlwaysFalsy if new_positive.is_literal_string() => {
-                        new_positive = Type::string_literal(db, "");
-                    }
-                    Type::Instance(InstanceType { class })
-                        if class.is_known(db, KnownClass::Bool) =>
-                    {
-                        match new_positive {
-                            // `bool & AlwaysTruthy` -> `Literal[True]`
-                            Type::AlwaysTruthy => {
-                                new_positive = Type::BooleanLiteral(true);
-                            }
-                            // `bool & AlwaysFalsy` -> `Literal[False]`
-                            Type::AlwaysFalsy => {
-                                new_positive = Type::BooleanLiteral(false);
-                            }
-                            _ => continue,
-                        }
-                    }
-                    // `LiteralString & AlwaysFalsy` -> `Literal[""]`
-                    Type::LiteralString if new_positive == Type::AlwaysFalsy => {
-                        new_positive = Type::string_literal(db, "");
-                    }
-                    _ => continue,
+            // `AlwaysTruthy & LiteralString` -> `LiteralString & ~Literal[""]`
+            Type::LiteralString if self.positive.swap_remove(&Type::AlwaysTruthy) => {
+                self.add_positive(db, Type::LiteralString);
+                self.add_negative(db, Type::string_literal(db, ""));
+            }
+            // `AlwaysFalsy & LiteralString` -> `Literal[""]`
+            Type::LiteralString if self.positive.swap_remove(&Type::AlwaysFalsy) => {
+                self.add_positive(db, Type::string_literal(db, ""));
+            }
+            // `LiteralString & ~AlwaysTruthy` -> `LiteralString & AlwaysFalsy` -> `Literal[""]`
+            Type::LiteralString if self.negative.swap_remove(&Type::AlwaysTruthy) => {
+                self.add_positive(db, Type::string_literal(db, ""));
+            }
+            // `LiteralString & ~AlwaysFalsy` -> `LiteralString & ~Literal[""]`
+            Type::LiteralString if self.negative.swap_remove(&Type::AlwaysFalsy) => {
+                self.add_positive(db, Type::LiteralString);
+                self.add_negative(db, Type::string_literal(db, ""));
+            }
+            // `(A & B & ~C) & (D & E & ~F)` -> `A & B & D & E & ~C & ~F`
+            Type::Intersection(other) => {
+                for pos in other.positive(db) {
+                    self.add_positive(db, *pos);
                 }
-                self.positive.swap_remove_index(index);
-                break;
+                for neg in other.negative(db) {
+                    self.add_negative(db, *neg);
+                }
             }
+            _ => {
+                let known_instance = new_positive
+                    .into_instance()
+                    .and_then(|instance| instance.class.known(db));
 
-            if addition_is_bool_instance {
-                for (index, existing_negative) in self.negative.iter().enumerate() {
-                    match existing_negative {
-                        // `bool & ~Literal[False]` -> `Literal[True]`
-                        // `bool & ~Literal[True]` -> `Literal[False]`
-                        Type::BooleanLiteral(bool_value) => {
-                            new_positive = Type::BooleanLiteral(!bool_value);
+                if known_instance == Some(KnownClass::Object) {
+                    // `object & T` -> `T`; it is always redundant to add `object` to an intersection
+                    return;
+                }
+
+                let addition_is_bool_instance = known_instance == Some(KnownClass::Bool);
+
+                for (index, existing_positive) in self.positive.iter().enumerate() {
+                    match existing_positive {
+                        // `AlwaysTruthy & bool` -> `Literal[True]`
+                        Type::AlwaysTruthy if addition_is_bool_instance => {
+                            new_positive = Type::BooleanLiteral(true);
                         }
-                        // `bool & ~AlwaysTruthy` -> `Literal[False]`
-                        Type::AlwaysTruthy => {
+                        // `AlwaysFalsy & bool` -> `Literal[False]`
+                        Type::AlwaysFalsy if addition_is_bool_instance => {
                             new_positive = Type::BooleanLiteral(false);
                         }
-                        // `bool & ~AlwaysFalsy` -> `Literal[True]`
-                        Type::AlwaysFalsy => {
-                            new_positive = Type::BooleanLiteral(true);
+                        Type::Instance(InstanceType { class })
+                            if class.is_known(db, KnownClass::Bool) =>
+                        {
+                            match new_positive {
+                                // `bool & AlwaysTruthy` -> `Literal[True]`
+                                Type::AlwaysTruthy => {
+                                    new_positive = Type::BooleanLiteral(true);
+                                }
+                                // `bool & AlwaysFalsy` -> `Literal[False]`
+                                Type::AlwaysFalsy => {
+                                    new_positive = Type::BooleanLiteral(false);
+                                }
+                                _ => continue,
+                            }
                         }
                         _ => continue,
                     }
-                    self.negative.swap_remove_index(index);
+                    self.positive.swap_remove_index(index);
                     break;
                 }
-            } else if new_positive.is_literal_string() {
-                if self.negative.swap_remove(&Type::AlwaysTruthy) {
-                    new_positive = Type::string_literal(db, "");
-                }
-            }
 
-            let mut to_remove = SmallVec::<[usize; 1]>::new();
-            for (index, existing_positive) in self.positive.iter().enumerate() {
-                // S & T = S    if S <: T
-                if existing_positive.is_subtype_of(db, new_positive)
-                    || existing_positive.is_same_gradual_form(new_positive)
-                {
-                    return;
+                if addition_is_bool_instance {
+                    for (index, existing_negative) in self.negative.iter().enumerate() {
+                        match existing_negative {
+                            // `bool & ~Literal[False]` -> `Literal[True]`
+                            // `bool & ~Literal[True]` -> `Literal[False]`
+                            Type::BooleanLiteral(bool_value) => {
+                                new_positive = Type::BooleanLiteral(!bool_value);
+                            }
+                            // `bool & ~AlwaysTruthy` -> `Literal[False]`
+                            Type::AlwaysTruthy => {
+                                new_positive = Type::BooleanLiteral(false);
+                            }
+                            // `bool & ~AlwaysFalsy` -> `Literal[True]`
+                            Type::AlwaysFalsy => {
+                                new_positive = Type::BooleanLiteral(true);
+                            }
+                            _ => continue,
+                        }
+                        self.negative.swap_remove_index(index);
+                        break;
+                    }
                 }
-                // same rule, reverse order
-                if new_positive.is_subtype_of(db, *existing_positive) {
-                    to_remove.push(index);
-                }
-                // A & B = Never    if A and B are disjoint
-                if new_positive.is_disjoint_from(db, *existing_positive) {
-                    *self = Self::default();
-                    self.positive.insert(Type::Never);
-                    return;
-                }
-            }
-            for index in to_remove.into_iter().rev() {
-                self.positive.swap_remove_index(index);
-            }
 
-            let mut to_remove = SmallVec::<[usize; 1]>::new();
-            for (index, existing_negative) in self.negative.iter().enumerate() {
-                // S & ~T = Never    if S <: T
-                if new_positive.is_subtype_of(db, *existing_negative) {
-                    *self = Self::default();
-                    self.positive.insert(Type::Never);
-                    return;
+                let mut to_remove = SmallVec::<[usize; 1]>::new();
+                for (index, existing_positive) in self.positive.iter().enumerate() {
+                    // S & T = S    if S <: T
+                    if existing_positive.is_subtype_of(db, new_positive)
+                        || existing_positive.is_same_gradual_form(new_positive)
+                    {
+                        return;
+                    }
+                    // same rule, reverse order
+                    if new_positive.is_subtype_of(db, *existing_positive) {
+                        to_remove.push(index);
+                    }
+                    // A & B = Never    if A and B are disjoint
+                    if new_positive.is_disjoint_from(db, *existing_positive) {
+                        *self = Self::default();
+                        self.positive.insert(Type::Never);
+                        return;
+                    }
                 }
-                // A & ~B = A    if A and B are disjoint
-                if existing_negative.is_disjoint_from(db, new_positive) {
-                    to_remove.push(index);
+                for index in to_remove.into_iter().rev() {
+                    self.positive.swap_remove_index(index);
                 }
-            }
-            for index in to_remove.into_iter().rev() {
-                self.negative.swap_remove_index(index);
-            }
 
-            self.positive.insert(new_positive);
+                let mut to_remove = SmallVec::<[usize; 1]>::new();
+                for (index, existing_negative) in self.negative.iter().enumerate() {
+                    // S & ~T = Never    if S <: T
+                    if new_positive.is_subtype_of(db, *existing_negative) {
+                        *self = Self::default();
+                        self.positive.insert(Type::Never);
+                        return;
+                    }
+                    // A & ~B = A    if A and B are disjoint
+                    if existing_negative.is_disjoint_from(db, new_positive) {
+                        to_remove.push(index);
+                    }
+                }
+                for index in to_remove.into_iter().rev() {
+                    self.negative.swap_remove_index(index);
+                }
+
+                self.positive.insert(new_positive);
+            }
         }
     }
 
@@ -397,7 +429,7 @@ impl<'db> InnerIntersectionBuilder<'db> {
             Type::Never => {
                 // Adding ~Never to an intersection is a no-op.
             }
-            Type::Instance(instance) if instance.class.is_known(db, KnownClass::Object) => {
+            Type::Instance(instance) if instance.class.is_object(db) => {
                 // Adding ~object to an intersection results in Never.
                 *self = Self::default();
                 self.positive.insert(Type::Never);
@@ -438,8 +470,8 @@ impl<'db> InnerIntersectionBuilder<'db> {
                         return;
                     }
                 }
-                for index in to_remove.iter().rev() {
-                    self.negative.swap_remove_index(*index);
+                for index in to_remove.into_iter().rev() {
+                    self.negative.swap_remove_index(index);
                 }
 
                 for existing_positive in &self.positive {
@@ -462,7 +494,7 @@ impl<'db> InnerIntersectionBuilder<'db> {
 
     fn build(mut self, db: &'db dyn Db) -> Type<'db> {
         match (self.positive.len(), self.negative.len()) {
-            (0, 0) => KnownClass::Object.to_instance(db),
+            (0, 0) => Type::object(db),
             (1, 0) => self.positive[0],
             _ => {
                 self.positive.shrink_to_fit();
@@ -515,7 +547,7 @@ mod tests {
         let db = setup_db();
 
         let intersection = IntersectionBuilder::new(&db).build();
-        assert_eq!(intersection, KnownClass::Object.to_instance(&db));
+        assert_eq!(intersection, Type::object(&db));
     }
 
     #[test_case(Type::BooleanLiteral(true))]
@@ -529,7 +561,7 @@ mod tests {
         // We add t_object in various orders (in first or second position) in
         // the tests below to ensure that the boolean simplification eliminates
         // everything from the intersection, not just `bool`.
-        let t_object = KnownClass::Object.to_instance(&db);
+        let t_object = Type::object(&db);
         let t_bool = KnownClass::Bool.to_instance(&db);
 
         let ty = IntersectionBuilder::new(&db)

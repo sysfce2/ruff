@@ -5,7 +5,7 @@ use crate::types::diagnostic::{
     TOO_MANY_POSITIONAL_ARGUMENTS, UNKNOWN_ARGUMENT,
 };
 use crate::types::signatures::Parameter;
-use crate::types::UnionType;
+use crate::types::{todo_type, UnionType};
 use ruff_python_ast as ast;
 
 /// Bind a [`CallArguments`] against a callable [`Signature`].
@@ -16,7 +16,7 @@ pub(crate) fn bind_call<'db>(
     db: &'db dyn Db,
     arguments: &CallArguments<'_, 'db>,
     signature: &Signature<'db>,
-    callable_ty: Option<Type<'db>>,
+    callable_ty: Type<'db>,
 ) -> CallBinding<'db> {
     let parameters = signature.parameters();
     // The type assigned to each parameter at this call site.
@@ -73,7 +73,7 @@ pub(crate) fn bind_call<'db>(
                 continue;
             }
         };
-        if let Some(expected_ty) = parameter.annotated_ty() {
+        if let Some(expected_ty) = parameter.annotated_type() {
             if !argument_ty.is_assignable_to(db, expected_ty) {
                 errors.push(CallBindingError::InvalidArgumentType {
                     parameter: ParameterContext::new(parameter, index, positional),
@@ -109,7 +109,8 @@ pub(crate) fn bind_call<'db>(
     for (index, bound_ty) in parameter_tys.iter().enumerate() {
         if bound_ty.is_none() {
             let param = &parameters[index];
-            if param.is_variadic() || param.is_keyword_variadic() || param.default_ty().is_some() {
+            if param.is_variadic() || param.is_keyword_variadic() || param.default_type().is_some()
+            {
                 // variadic/keywords and defaulted arguments are not required
                 continue;
             }
@@ -137,7 +138,7 @@ pub(crate) fn bind_call<'db>(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CallBinding<'db> {
     /// Type of the callable object (function, class...)
-    callable_ty: Option<Type<'db>>,
+    callable_ty: Type<'db>,
 
     /// Return type of the call.
     return_ty: Type<'db>,
@@ -151,36 +152,36 @@ pub(crate) struct CallBinding<'db> {
 
 impl<'db> CallBinding<'db> {
     // TODO remove this constructor and construct always from `bind_call`
-    pub(crate) fn from_return_ty(return_ty: Type<'db>) -> Self {
+    pub(crate) fn from_return_type(return_ty: Type<'db>) -> Self {
         Self {
-            callable_ty: None,
+            callable_ty: todo_type!("CallBinding::from_return_type"),
             return_ty,
             parameter_tys: Box::default(),
             errors: vec![],
         }
     }
 
-    pub(crate) fn set_return_ty(&mut self, return_ty: Type<'db>) {
+    pub(crate) fn set_return_type(&mut self, return_ty: Type<'db>) {
         self.return_ty = return_ty;
     }
 
-    pub(crate) fn return_ty(&self) -> Type<'db> {
+    pub(crate) fn return_type(&self) -> Type<'db> {
         self.return_ty
     }
 
-    pub(crate) fn parameter_tys(&self) -> &[Type<'db>] {
+    pub(crate) fn parameter_types(&self) -> &[Type<'db>] {
         &self.parameter_tys
     }
 
-    pub(crate) fn one_parameter_ty(&self) -> Option<Type<'db>> {
-        match self.parameter_tys() {
+    pub(crate) fn one_parameter_type(&self) -> Option<Type<'db>> {
+        match self.parameter_types() {
             [ty] => Some(*ty),
             _ => None,
         }
     }
 
-    pub(crate) fn two_parameter_tys(&self) -> Option<(Type<'db>, Type<'db>)> {
-        match self.parameter_tys() {
+    pub(crate) fn two_parameter_types(&self) -> Option<(Type<'db>, Type<'db>)> {
+        match self.parameter_types() {
             [first, second] => Some((*first, *second)),
             _ => None,
         }
@@ -188,8 +189,8 @@ impl<'db> CallBinding<'db> {
 
     fn callable_name(&self, db: &'db dyn Db) -> Option<&str> {
         match self.callable_ty {
-            Some(Type::FunctionLiteral(function)) => Some(function.name(db)),
-            Some(Type::ClassLiteral(class_type)) => Some(class_type.class.name(db)),
+            Type::FunctionLiteral(function) => Some(function.name(db)),
+            Type::ClassLiteral(class_type) => Some(class_type.class.name(db)),
             _ => None,
         }
     }

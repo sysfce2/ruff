@@ -4,14 +4,14 @@
 
 ```py
 class Multiplier:
-    def __init__(self, factor: float):
+    def __init__(self, factor: int):
         self.factor = factor
 
-    def __call__(self, number: float) -> float:
+    def __call__(self, number: int) -> int:
         return number * self.factor
 
-a = Multiplier(2.0)(3.0)
-reveal_type(a)  # revealed: float
+a = Multiplier(2)(3)
+reveal_type(a)  # revealed: int
 
 class Unit: ...
 
@@ -52,7 +52,7 @@ class NonCallable:
     __call__ = 1
 
 a = NonCallable()
-# error: "Object of type `NonCallable` is not callable"
+# error: "Object of type `Unknown | Literal[1]` is not callable (due to union element `Literal[1]`)"
 reveal_type(a())  # revealed: Unknown
 ```
 
