@@ -3,12 +3,10 @@ use std::fmt::{Formatter, Write};
 use std::fs;
 use std::path::Path;
 
-use annotate_snippets::display_list::{DisplayList, FormatOptions};
-use annotate_snippets::snippet::{AnnotationType, Slice, Snippet, SourceAnnotation};
-
+use ruff_annotate_snippets::{Level, Renderer, Snippet};
 use ruff_python_ast::visitor::source_order::{walk_module, SourceOrderVisitor, TraversalSignal};
 use ruff_python_ast::{AnyNodeRef, Mod};
-use ruff_python_parser::{parse_unchecked, Mode, ParseErrorType, Token};
+use ruff_python_parser::{parse_unchecked, Mode, ParseErrorType, ParseOptions, Token};
 use ruff_source_file::{LineIndex, OneIndexed, SourceCode};
 use ruff_text_size::{Ranged, TextLen, TextRange, TextSize};
 
@@ -36,7 +34,7 @@ fn inline_err() {
 /// Snapshots the AST.
 fn test_valid_syntax(input_path: &Path) {
     let source = fs::read_to_string(input_path).expect("Expected test file to exist");
-    let parsed = parse_unchecked(&source, Mode::Module);
+    let parsed = parse_unchecked(&source, ParseOptions::from(Mode::Module));
 
     if !parsed.is_valid() {
         let line_index = LineIndex::from_source_text(&source);
@@ -80,7 +78,7 @@ fn test_valid_syntax(input_path: &Path) {
 /// Snapshots the AST and the error messages.
 fn test_invalid_syntax(input_path: &Path) {
     let source = fs::read_to_string(input_path).expect("Expected test file to exist");
-    let parsed = parse_unchecked(&source, Mode::Module);
+    let parsed = parse_unchecked(&source, ParseOptions::from(Mode::Module));
 
     assert!(
         !parsed.is_valid(),
@@ -132,7 +130,7 @@ f'{'
 f'{foo!r'
 ";
 
-    let parsed = parse_unchecked(source, Mode::Module);
+    let parsed = parse_unchecked(source, ParseOptions::from(Mode::Module));
 
     println!("AST:\n----\n{:#?}", parsed.syntax());
     println!("Tokens:\n-------\n{:#?}", parsed.tokens());
@@ -203,33 +201,18 @@ impl std::fmt::Display for CodeFrame<'_> {
             .source_code
             .slice(TextRange::new(start_offset, end_offset));
 
-        let start_char = source[TextRange::up_to(annotation_range.start())]
-            .chars()
-            .count();
-
-        let char_length = source[annotation_range].chars().count();
         let label = format!("Syntax Error: {error}", error = self.error);
 
-        let snippet = Snippet {
-            title: None,
-            slices: vec![Slice {
-                source,
-                line_start: start_index.get(),
-                annotations: vec![SourceAnnotation {
-                    label: &label,
-                    annotation_type: AnnotationType::Error,
-                    range: (start_char, start_char + char_length),
-                }],
-                // The origin (file name, line number, and column number) is already encoded
-                // in the `label`.
-                origin: None,
-                fold: false,
-            }],
-            footer: Vec::new(),
-            opt: FormatOptions::default(),
-        };
-
-        writeln!(f, "{message}", message = DisplayList::from(snippet))
+        let span = usize::from(annotation_range.start())..usize::from(annotation_range.end());
+        let annotation = Level::Error.span(span).label(&label);
+        let snippet = Snippet::source(source)
+            .line_start(start_index.get())
+            .annotation(annotation)
+            .fold(false);
+        let message = Level::None.title("").snippet(snippet);
+        let renderer = Renderer::plain().cut_indicator("…");
+        let rendered = renderer.render(message);
+        writeln!(f, "{rendered}")
     }
 }
 
