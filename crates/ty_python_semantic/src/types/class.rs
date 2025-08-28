@@ -30,11 +30,11 @@ use crate::types::tuple::{TupleSpec, TupleType};
 use crate::types::typed_dict::typed_dict_params_from_class_def;
 use crate::types::{
     ApplyTypeMappingVisitor, Binding, BoundSuperError, BoundSuperType, CallableType,
-    DataclassParams, DeprecatedInstance, HasRelationToVisitor, IsEquivalentVisitor,
-    KnownInstanceType, ManualPEP695TypeAliasType, MaterializationKind, NormalizedVisitor,
-    PropertyInstanceType, StringLiteralType, TypeAliasType, TypeMapping, TypeRelation,
-    TypeVarBoundOrConstraints, TypeVarInstance, TypeVarKind, TypedDictParams, VarianceInferable,
-    declaration_type, infer_definition_types, todo_type,
+    DataclassParams, DeprecatedInstance, FindLegacyTypeVarsVisitor, HasRelationToVisitor,
+    IsEquivalentVisitor, KnownInstanceType, ManualPEP695TypeAliasType, MaterializationKind,
+    NormalizedVisitor, PropertyInstanceType, StringLiteralType, TypeAliasType, TypeMapping,
+    TypeRelation, TypeVarBoundOrConstraints, TypeVarInstance, TypeVarKind, TypedDictParams,
+    VarianceInferable, declaration_type, infer_definition_types, todo_type,
 };
 use crate::{
     Db, FxIndexMap, FxOrderSet, Program,
@@ -303,14 +303,15 @@ impl<'db> GenericAlias<'db> {
         )
     }
 
-    pub(super) fn find_legacy_typevars(
+    pub(super) fn find_legacy_typevars_impl(
         self,
         db: &'db dyn Db,
         binding_context: Option<Definition<'db>>,
         typevars: &mut FxOrderSet<BoundTypeVarInstance<'db>>,
+        visitor: &FindLegacyTypeVarsVisitor<'db>,
     ) {
         self.specialization(db)
-            .find_legacy_typevars(db, binding_context, typevars);
+            .find_legacy_typevars_impl(db, binding_context, typevars, visitor);
     }
 
     pub(super) fn is_typed_dict(self, db: &'db dyn Db) -> bool {
@@ -503,15 +504,18 @@ impl<'db> ClassType<'db> {
         }
     }
 
-    pub(super) fn find_legacy_typevars(
+    pub(super) fn find_legacy_typevars_impl(
         self,
         db: &'db dyn Db,
         binding_context: Option<Definition<'db>>,
         typevars: &mut FxOrderSet<BoundTypeVarInstance<'db>>,
+        visitor: &FindLegacyTypeVarsVisitor<'db>,
     ) {
         match self {
             Self::NonGeneric(_) => {}
-            Self::Generic(generic) => generic.find_legacy_typevars(db, binding_context, typevars),
+            Self::Generic(generic) => {
+                generic.find_legacy_typevars_impl(db, binding_context, typevars, visitor);
+            }
         }
     }
 
@@ -2686,7 +2690,7 @@ impl<'db> ClassLiteral<'db> {
         // that attribute. We include `Unknown` in that union to account for the fact that the
         // attribute might be externally modified.
         let mut union_of_inferred_types = UnionBuilder::new(db);
-        let mut qualifiers = TypeQualifiers::empty();
+        let mut qualifiers = TypeQualifiers::IMPLICIT_INSTANCE_ATTRIBUTE;
 
         let mut is_attribute_bound = false;
 
@@ -2736,20 +2740,11 @@ impl<'db> ClassLiteral<'db> {
                 //     self.name: <annotation>
                 //     self.name: <annotation> = …
 
-                let reachability = use_def_map(db, method_scope)
-                    .declaration_reachability(db, &attribute_declaration);
-
-                if reachability.is_always_false() {
-                    continue;
-                }
-
                 let annotation = declaration_type(db, declaration);
-                let mut annotation =
-                    Place::bound(annotation.inner).with_qualifiers(annotation.qualifiers);
+                let annotation = Place::bound(annotation.inner).with_qualifiers(
+                    annotation.qualifiers | TypeQualifiers::IMPLICIT_INSTANCE_ATTRIBUTE,
+                );
 
-                if reachability.is_ambiguous() {
-                    annotation.qualifiers |= TypeQualifiers::POSSIBLY_UNBOUND_IMPLICIT_ATTRIBUTE;
-                }
                 if let Some(all_qualifiers) = annotation.is_bare_final() {
                     if let Some(value) = assignment.value(&module) {
                         // If we see an annotated assignment with a bare `Final` as in
@@ -2781,8 +2776,6 @@ impl<'db> ClassLiteral<'db> {
                 continue;
             }
 
-            let method_map = use_def_map(db, method_scope);
-
             // The attribute assignment inherits the reachability of the method which contains it
             let is_method_reachable =
                 if let Some(method_def) = method_scope.node(db).as_function(&module) {
@@ -2802,53 +2795,16 @@ impl<'db> ClassLiteral<'db> {
                 continue;
             }
 
-            // Storage for the implicit `DefinitionState::Undefined` binding. If present, it
-            // will be the first binding in the `attribute_assignments` iterator.
-            let mut unbound_binding = None;
-
             for attribute_assignment in attribute_assignments {
                 if let DefinitionState::Undefined = attribute_assignment.binding {
-                    // Store the implicit unbound binding here so that we can delay the
-                    // computation of `unbound_reachability` to the point when we actually
-                    // need it. This is an optimization for the common case where the
-                    // `unbound` binding is the only binding of the `name` attribute,
-                    // i.e. if there is no `self.name = …` assignment in this method.
-                    unbound_binding = Some(attribute_assignment);
                     continue;
                 }
 
                 let DefinitionState::Defined(binding) = attribute_assignment.binding else {
                     continue;
                 };
-                match method_map
-                    .binding_reachability(db, &attribute_assignment)
-                    .and(is_method_reachable)
-                {
-                    Truthiness::AlwaysTrue => {
-                        is_attribute_bound = true;
-                    }
-                    Truthiness::Ambiguous => {
-                        is_attribute_bound = true;
-                        qualifiers |= TypeQualifiers::POSSIBLY_UNBOUND_IMPLICIT_ATTRIBUTE;
-                    }
-                    Truthiness::AlwaysFalse => {
-                        continue;
-                    }
-                }
 
-                // There is at least one attribute assignment that may be reachable, so if `unbound_reachability` is
-                // always false then this attribute is considered bound.
-                // TODO: this is incomplete logic since the attributes bound after termination are considered reachable.
-                let unbound_reachability = unbound_binding
-                    .as_ref()
-                    .map(|binding| method_map.binding_reachability(db, binding))
-                    .unwrap_or(Truthiness::AlwaysFalse);
-
-                if unbound_reachability
-                    .negate()
-                    .and(is_method_reachable)
-                    .is_always_true()
-                {
+                if !is_method_reachable.is_always_false() {
                     is_attribute_bound = true;
                 }
 
